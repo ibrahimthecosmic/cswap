@@ -1,0 +1,24 @@
+[package]
+name = "cswap"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Multi-account switcher for Claude Code"
+license = "MIT"
+
+[features]
+# `usage` adds the only dependency in the project: HTTPS for the Anthropic
+# usage/token endpoints. Build with --no-default-features for a zero-dependency
+# switcher (T0: add/list/switch/status/remove, no network).
+default = ["usage"]
+usage = ["dep:ureq"]
+
+[dependencies]
+ureq = { version = "3", default-features = false, features = ["rustls"], optional = true }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -1,0 +1,48 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Debug symbols are the bulk of a debug build's size and nothing here needs a
+  # backtrace with line numbers; dropping them keeps the cache small and warm.
+  CARGO_PROFILE_TEST_DEBUG: 0
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Cache cargo registry and build output
+        uses: Swatinem/rust-cache@v2
+        with:
+          # One cache per OS. Without this the two matrix legs share a key and
+          # keep evicting each other's target directory.
+          key: ${{ matrix.os }}
+
+      - run: cargo test --locked --all-features
+      - run: cargo build --locked --release
+
+      # The zero-dependency configuration is a supported build, so it has to
+      # keep compiling — cleanly. Warnings there are usually a cfg that drifted.
+      - name: Build without default features
+        run: cargo build --locked --release --no-default-features
+        env:
+          RUSTFLAGS: -D warnings
+
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: cargo fmt --check
