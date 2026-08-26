@@ -17,8 +17,8 @@ os=$(uname -s)
 arch=$(uname -m)
 case "$os-$arch" in
   Linux-x86_64|Linux-amd64) asset="cswap-linux-x86_64" ;;
-  Darwin-*) die "no macOS binary is published yet — build from source: cargo install --git https://github.com/$REPO" ;;
-  *) die "unsupported platform $os-$arch — build from source: cargo install --git https://github.com/$REPO" ;;
+  Darwin-*) die "no macOS binary is published yet - build from source: cargo install --git https://github.com/$REPO" ;;
+  *) die "unsupported platform $os-$arch - build from source: cargo install --git https://github.com/$REPO" ;;
 esac
 
 if [ "$VERSION" = latest ]; then
@@ -39,7 +39,7 @@ tmp=$(mktemp) || die "could not create a temporary file"
 trap 'rm -f "$tmp"' EXIT INT TERM
 
 printf 'Downloading %s (%s)...\n' "$asset" "$VERSION"
-fetch "$url" "$tmp" || die "download failed — does the release exist? $url"
+fetch "$url" "$tmp" || die "download failed - does the release exist? $url"
 
 # Refuse an HTML error page renamed to look like a binary.
 head -c 4 "$tmp" | grep -q ELF || die "downloaded file is not a Linux executable"
