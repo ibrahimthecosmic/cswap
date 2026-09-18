@@ -111,6 +111,20 @@ slot. Importing does not log you in — run `cswap switch` after it.
 (0600), `export` will not silently overwrite an existing file, and the sensible
 thing is to delete it once it has been imported.
 
+**An export is a point-in-time copy of a single-use token lineage.** Refreshing
+rotates the refresh token and invalidates the one before it, so once either
+machine refreshes, the other machine's copy stops working — it reports the login
+as expired while the machine that refreshed carries on fine. Export immediately
+before you import, and expect to repeat it rather than treating the two stores
+as synchronised. To use one account on two machines at the same time, log in
+separately on each (`claude`, then `cswap add`): each login gets its own lineage,
+and the two do not fight.
+
+Exporting the account you are currently logged in as takes the credential Claude
+Code is using right now, not the slot's last snapshot — Claude Code refreshes in
+place, and a snapshot older than that is already spent. The snapshot is refiled
+on the way past, so the store stops being stale too.
+
 ## Dependencies
 
 One, and only for T1: [`ureq`](https://docs.rs/ureq) (with `rustls`) for HTTPS to

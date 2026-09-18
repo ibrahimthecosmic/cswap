@@ -313,9 +313,24 @@ pub fn export(selector: Option<&str>, flags: &Flags) -> R<ExitCode> {
         return Err("no accounts stored — run `cswap add` first".into());
     }
 
+    // The account Claude Code is logged in as right now has a credential that
+    // moves without the store hearing about it: Claude Code refreshes in place,
+    // and only `add` and `switch` file the result. Its backup is therefore a
+    // past generation, and a refresh token from a past generation is dead the
+    // moment the live one rotates — so exporting the backup would ship a
+    // credential that fails on the other machine while this one keeps working.
+    // Re-file the live state under its slot first, exactly as `switch` does.
+    let live_email =
+        live::active_identity()?.and_then(|o| o.get_str("emailAddress").map(str::to_string));
+    let live_credentials = live::read_credentials()?;
+
     let mut items = Vec::new();
     for account in &selected {
-        match portable_for(account) {
+        let live = live_email
+            .as_deref()
+            .filter(|e| e.eq_ignore_ascii_case(&account.email))
+            .and(live_credentials.as_deref());
+        match portable_for(account, live) {
             Ok(item) => items.push(item),
             // Asking for one account and not getting it is an error; sweeping up
             // all of them steps over the ones that are not exportable, which is
@@ -511,7 +526,19 @@ pub fn import(source: &str, flags: &Flags) -> R<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn portable_for(account: &Account) -> R<Portable> {
+/// Gather one account for export. `live` is the credential Claude Code is using
+/// right now, and is passed only when it belongs to *this* account: it is then
+/// filed under the slot before anything is read back, so what travels is the
+/// generation in use rather than whatever the store last saw.
+fn portable_for(account: &Account, live: Option<&str>) -> R<Portable> {
+    if let Some(live) = live {
+        back_up(account, live).map_err(|e| {
+            format!(
+                "account {} ({}): could not file its live login: {e}",
+                account.num, account.email
+            )
+        })?;
+    }
     let credentials = store::read_backup(account.num, &account.email)?.ok_or_else(|| {
         format!(
             "account {} ({}): no stored login — log in as it and run `cswap add --slot {}`",
