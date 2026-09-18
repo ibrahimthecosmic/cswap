@@ -20,13 +20,14 @@ $ cswap
 
 Two tiers, and no more:
 
-- **T0 — the switcher.** `add`, `list`, `switch`, `status`, `remove`.
+- **T0 — the switcher.** `add`, `list`, `switch`, `status`, `remove`, and
+  `export` / `import` to carry accounts between machines.
 - **T1 — quota.** Live 5h / 7d / per-model numbers on `list`, with token refresh
   and a short-lived cache.
 
-Auto-switching, session mode (`run`), directory mappings, import/export and the
-TUI are **not** implemented and are not planned. If you want those, use the
-Python tool — it reads the same store, so you can have both.
+Auto-switching, session mode (`run`), directory mappings and the TUI are **not**
+implemented and are not planned. If you want those, use the Python tool — it
+reads the same store, so you can have both.
 
 ## Install
 
@@ -71,14 +72,44 @@ cswap add --slot 3 --alias work
 cswap status
 cswap remove 3
 cswap upgrade
+
+cswap export you@example.com --output ./creds.json   # one account
+cswap export --output ./accounts.json                # all of them
+cswap import ./creds.json                            # on the other machine
 ```
 
-`--json` on `list`, `status` and `switch` emits a single object on stdout.
+`--json` on `list`, `status`, `switch`, `export` and `import` emits a single
+object on stdout.
 `--refresh` bypasses the quota cache, `--offline` never touches the network, and
 `--no-usage` skips quota entirely.
 
 Re-running `add` while logged in as an account you already have updates that
 slot in place — that is how you recover an expired login.
+
+### Moving accounts between machines
+
+`export` writes one account, or every account, as a single JSON file; `import`
+reads it back into another machine's store. `-` stands for stdout and stdin, so
+the two pipe together:
+
+```sh
+cswap export work --output - | ssh other-box cswap import -
+```
+
+What travels is the login and nothing else: the credential, and the
+`oauthAccount` block that names it. The stored config snapshot — your whole
+`~/.claude.json`, projects and history included — stays where it is; `switch`
+only ever reads that one key out of it.
+
+`import` places each account the way `add` does: an account you already have
+updates its existing slot, anything new takes the next free one. `--slot` and
+`--alias` override that for a single-account file, and `--force` is required to
+overwrite a slot that holds someone else or to move an account to a different
+slot. Importing does not log you in — run `cswap switch` after it.
+
+**The file holds live OAuth tokens in plaintext.** It is written owner-only
+(0600), `export` will not silently overwrite an existing file, and the sensible
+thing is to delete it once it has been imported.
 
 ## Dependencies
 

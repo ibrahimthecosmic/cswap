@@ -4,7 +4,8 @@
 //! reading and writing that tool's own on-disk store so the two can share a
 //! machine. Scope is deliberately two tiers: T0, the switcher (`add`, `list`,
 //! `switch`, `status`, `remove`), and T1, live quota numbers on `list`.
-//! Auto-switching, session mode, import/export and the TUI are out of scope.
+//! Auto-switching, session mode and the TUI are out of scope; `export` and
+//! `import` move accounts between machines without one.
 
 mod b64;
 mod fsx;
@@ -13,6 +14,7 @@ mod live;
 mod lock;
 mod model;
 mod paths;
+mod portable;
 mod store;
 mod timefmt;
 
@@ -83,6 +85,9 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
                 );
             }
             "--alias" => flags.alias = Some(it.next().ok_or("--alias needs a name")?.clone()),
+            "--output" | "-o" => {
+                flags.output = Some(it.next().ok_or("--output needs a path")?.clone())
+            }
             "--help" | "-h" | "help" => {
                 print!("{}", help_text());
                 return Ok(ExitCode::SUCCESS);
@@ -91,7 +96,10 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
                 println!("cswap {VERSION}");
                 return Ok(ExitCode::SUCCESS);
             }
-            other if other.starts_with('-') => return Err(format!("unknown flag '{other}'")),
+            // A bare '-' is stdin/stdout for import/export, not a flag.
+            other if other.starts_with('-') && other != "-" => {
+                return Err(format!("unknown flag '{other}'"))
+            }
             other => positional.push(other),
         }
     }
@@ -104,6 +112,14 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         "status" => cmd::status(&flags),
         "switch" => cmd::switch(rest.first().copied(), &flags),
         "add" => cmd::add(&flags),
+        "export" => cmd::export(rest.first().copied(), &flags),
+        "import" => {
+            let source = rest
+                .first()
+                .copied()
+                .ok_or("import needs a file (or `-` for stdin)")?;
+            cmd::import(source, &flags)
+        }
         "upgrade" => cmd::upgrade(&flags),
         "remove" | "rm" => {
             let target = rest
@@ -127,6 +143,7 @@ pub struct Flags {
     pub check: bool,
     pub slot: Option<i64>,
     pub alias: Option<String>,
+    pub output: Option<String>,
 }
 
 fn help_text() -> String {
@@ -143,6 +160,8 @@ COMMANDS
   switch [<account>]   Switch accounts; bare rotates to the next one
   add                  Store the account you are logged in as right now
   remove <account>     Forget an account and delete its stored login
+  export [<account>]   Write accounts to a portable file; bare exports all
+  import <file>        Read accounts back out of one (`-` reads stdin)
   upgrade              Replace this binary with the latest GitHub release
 
   <account> is a slot number, an email, or an alias.
@@ -152,14 +171,20 @@ OPTIONS
   --refresh            Ignore cached quota numbers and re-fetch
   --offline            Never touch the network; show cached numbers only
   --no-usage           Skip quota entirely (list/status)
-  --slot <n>           add: which slot to write (default: reuse or next free)
-  --alias <name>       add: give the account a short name
+  --slot <n>           add/import: which slot to write (default: reuse or next free)
+  --alias <name>       add/import: give the account a short name
+  --output, -o <file>  export: where to write it (`-` writes stdout)
   --force              switch: re-activate even if it is already active
+                       export: overwrite the output file
+                       import: overwrite or move an occupied slot
   --yes                remove: do not ask for confirmation
   --check              upgrade: report what is available, install nothing
   --help, --version
 
 NOTES
+  An export holds live login tokens in plaintext. It is written owner-only;
+  keep it off shared storage and delete it once it has been imported.
+
   Switching does not usually need a restart. On Linux and Windows Claude Code
   re-reads its credentials file when it changes, so the new account applies on
   your next message. On macOS the Keychain read is cached for ~30s.

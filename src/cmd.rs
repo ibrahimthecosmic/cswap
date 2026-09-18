@@ -1,13 +1,14 @@
-//! The five commands.
+//! The commands.
 
-use std::io::{IsTerminal, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use crate::fsx::R;
+use crate::fsx::{self, R};
 use crate::json::Json;
 use crate::lock::{DirLock, FileLock};
 use crate::model::Row;
+use crate::portable::{self, Portable};
 use crate::render;
 use crate::store::{self, Account, Store};
 use crate::{live, Flags};
@@ -286,6 +287,272 @@ pub fn remove(selector: &str, flags: &Flags) -> R<ExitCode> {
         );
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Write one account, or every account, to a portable JSON file.
+///
+/// The file it writes holds live OAuth tokens in the clear — the same bytes the
+/// store already keeps, so this is not a new exposure, but it is one that leaves
+/// the directory the store protects. Hence 0600, a refusal to clobber an
+/// existing file without `--force`, and a warning on stderr.
+pub fn export(selector: Option<&str>, flags: &Flags) -> R<ExitCode> {
+    let destination = flags
+        .output
+        .as_deref()
+        .ok_or("export needs --output <file> (use `--output -` for stdout)")?;
+
+    let _guard = FileLock::store(STORE_LOCK_TIMEOUT)?;
+    let store_ref = Store::load()?;
+    let selected = match selector {
+        Some(sel) => vec![store_ref
+            .get(store_ref.resolve(sel)?)
+            .expect("resolved account exists")],
+        None => store_ref.accounts(),
+    };
+    if selected.is_empty() {
+        return Err("no accounts stored — run `cswap add` first".into());
+    }
+
+    let mut items = Vec::new();
+    for account in &selected {
+        match portable_for(account) {
+            Ok(item) => items.push(item),
+            // Asking for one account and not getting it is an error; sweeping up
+            // all of them steps over the ones that are not exportable, which is
+            // the only way a store with one broken slot can be backed up at all.
+            Err(e) if selector.is_none() => eprintln!("cswap: skipping {e}"),
+            Err(e) => return Err(e),
+        }
+    }
+    if items.is_empty() {
+        return Err("no stored account has a login to export".into());
+    }
+
+    let text = portable::envelope(&items).dump_pretty();
+    if destination == "-" {
+        println!("{text}");
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let path = std::path::Path::new(destination);
+    if path.exists() && !flags.force {
+        return Err(format!(
+            "{destination} already exists — pass --force to overwrite it"
+        ));
+    }
+    fsx::write_atomic(path, &text)?;
+    eprintln!(
+        "cswap: warning: {destination} holds live login tokens in plaintext. \
+         Keep it off shared storage and delete it once imported."
+    );
+
+    if flags.json {
+        let mut out = Json::obj();
+        out.set("schemaVersion", Json::num(1));
+        out.set("output", Json::str(destination));
+        out.set(
+            "accounts",
+            Json::Arr(
+                items
+                    .iter()
+                    .map(|item| {
+                        let mut entry = Json::obj();
+                        entry.set("slot", item.slot.map_or(Json::Null, Json::num));
+                        entry.set("email", Json::str(&item.email));
+                        entry
+                    })
+                    .collect(),
+            ),
+        );
+        println!("{}", out.dump_pretty());
+    } else {
+        println!(
+            "Exported {} to {destination}.",
+            plural(items.len(), "account")
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Read accounts back out of a file written by `export`.
+///
+/// Unlike `add`, this does not touch the active marker: importing a login is not
+/// logging into it. `cswap switch` still does that, and only that.
+pub fn import(source: &str, flags: &Flags) -> R<ExitCode> {
+    let text = read_source(source)?;
+    let items = portable::parse(&text)?;
+    if items.len() > 1 {
+        if flags.slot.is_some() {
+            return Err(format!(
+                "--slot takes a single account, but {source} holds {}",
+                items.len()
+            ));
+        }
+        if flags.alias.is_some() {
+            return Err(format!(
+                "--alias takes a single account, but {source} holds {}",
+                items.len()
+            ));
+        }
+    }
+
+    let _guard = FileLock::store(STORE_LOCK_TIMEOUT)?;
+    let mut store_ref = Store::load()?;
+    let mut imported: Vec<(i64, String, bool)> = Vec::new();
+
+    for item in &items {
+        // Matching on identity first means re-importing an account updates the
+        // slot it already has — that is how a refreshed export replaces a login
+        // that expired here.
+        let existing = store_ref.accounts().into_iter().find(|a| {
+            a.email.eq_ignore_ascii_case(&item.email) || (a.uuid.is_some() && a.uuid == item.uuid)
+        });
+        let num = match (flags.slot, &existing) {
+            (Some(slot), _) => slot,
+            (None, Some(account)) => account.num,
+            (None, None) => store_ref.free_slot(),
+        };
+
+        if let Some(occupant) = store_ref.get(num) {
+            if !occupant.email.eq_ignore_ascii_case(&item.email) {
+                if !flags.force {
+                    return Err(format!(
+                        "slot {num} already holds {} — pass --force to overwrite it",
+                        occupant.email
+                    ));
+                }
+                // The store keys its files by slot *and* email, so overwriting
+                // with a different identity would otherwise strand the old
+                // account's credential on disk under nobody's name.
+                store::remove_backup(occupant.num, &occupant.email);
+            }
+        }
+
+        // The same account arriving at a different slot is a move, not a copy:
+        // two slots claiming one login make `switch <email>` ambiguous.
+        let mut keep_active = false;
+        if let Some(previous) = existing.as_ref().filter(|a| a.num != num) {
+            if !flags.force {
+                return Err(format!(
+                    "{} is already stored in slot {} — pass --force to move it to slot {num}",
+                    item.email, previous.num
+                ));
+            }
+            keep_active = store_ref.active() == Some(previous.num);
+            store::remove_backup(previous.num, &previous.email);
+            store_ref.unregister(previous.num);
+        }
+
+        let alias = if items.len() == 1 {
+            flags.alias.clone()
+        } else {
+            None
+        };
+        let account = item.to_account(num, alias);
+
+        store::write_backup(num, &account.email, &item.credentials)?;
+        // `switch` reads exactly one key out of the stored snapshot, so a slot
+        // that has none only needs that key. One that already has a full
+        // snapshot keeps it — the import is a new login for the same account,
+        // not a reason to drop its config.
+        let mut config = match store::read_config(num, &account.email)? {
+            Some(existing_config) if existing_config.is_obj() => existing_config,
+            _ => Json::obj(),
+        };
+        config.set("oauthAccount", item.oauth_account.clone());
+        store::write_config(num, &account.email, &config)?;
+
+        store_ref.register(&account);
+        if let Some(alias) = &account.alias {
+            set_alias(&mut store_ref, num, alias);
+        }
+        if keep_active {
+            store_ref.set_active(num);
+        }
+        imported.push((num, account.email.clone(), existing.is_some()));
+    }
+    let active = store_ref.active();
+    store_ref.save()?;
+
+    if flags.json {
+        let mut out = Json::obj();
+        out.set("schemaVersion", Json::num(1));
+        out.set(
+            "imported",
+            Json::Arr(
+                imported
+                    .iter()
+                    .map(|(num, email, updated)| {
+                        let mut entry = Json::obj();
+                        entry.set("slot", Json::num(*num));
+                        entry.set("email", Json::str(email));
+                        entry.set("updated", Json::Bool(*updated));
+                        entry
+                    })
+                    .collect(),
+            ),
+        );
+        println!("{}", out.dump_pretty());
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    println!("Imported {}:", plural(imported.len(), "account"));
+    for (num, email, updated) in &imported {
+        let verb = if *updated { "updated" } else { "new" };
+        println!("  {num}  {email}  ({verb})");
+    }
+    // Importing a login is not logging into it, so say so — unless one of these
+    // slots is the account already in use.
+    if !imported.iter().any(|(num, _, _)| Some(*num) == active) {
+        if let Some((num, _, _)) = imported.first() {
+            println!("Nothing is logged in as these yet — run `cswap switch {num}` to use one.");
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn portable_for(account: &Account) -> R<Portable> {
+    let credentials = store::read_backup(account.num, &account.email)?.ok_or_else(|| {
+        format!(
+            "account {} ({}): no stored login — log in as it and run `cswap add --slot {}`",
+            account.num, account.email, account.num
+        )
+    })?;
+    let config = store::read_config(account.num, &account.email)?.ok_or_else(|| {
+        format!(
+            "account {} ({}): no stored config snapshot",
+            account.num, account.email
+        )
+    })?;
+    let oauth_account = config
+        .get("oauthAccount")
+        .ok_or_else(|| {
+            format!(
+                "account {} ({}): its stored config has no oauthAccount block",
+                account.num, account.email
+            )
+        })?
+        .clone();
+    Ok(Portable::from_account(account, credentials, oauth_account))
+}
+
+fn read_source(source: &str) -> R<String> {
+    if source == "-" {
+        let mut text = String::new();
+        std::io::stdin()
+            .read_to_string(&mut text)
+            .map_err(|e| format!("stdin: {e}"))?;
+        return Ok(text);
+    }
+    std::fs::read_to_string(source).map_err(|e| format!("{source}: {e}"))
+}
+
+fn plural(n: usize, noun: &str) -> String {
+    if n == 1 {
+        format!("{n} {noun}")
+    } else {
+        format!("{n} {noun}s")
+    }
 }
 
 #[cfg(feature = "usage")]
