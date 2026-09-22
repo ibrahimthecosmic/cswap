@@ -24,6 +24,8 @@ Two tiers, and no more:
   `export` / `import` to carry accounts between machines.
 - **T1 — quota.** Live 5h / 7d / per-model numbers on `list`, with token refresh
   and a short-lived cache.
+- **Borrowing.** `borrow` / `lease` / `token`: use a login that lives on another
+  of your machines, over SSH, without ever copying its refresh token.
 
 Auto-switching, session mode (`run`), directory mappings and the TUI are **not**
 implemented and are not planned. If you want those, use the Python tool — it
@@ -72,6 +74,9 @@ cswap add --slot 3 --alias work
 cswap status
 cswap remove 3
 cswap upgrade
+
+cswap borrow work --from me@desktop                  # use desktop's "work" login here
+cswap lease                                          # keep borrowed logins current
 
 cswap export you@example.com --output ./creds.json   # one account
 cswap export --output ./accounts.json                # all of them
@@ -125,6 +130,50 @@ Code is using right now, not the slot's last snapshot — Claude Code refreshes 
 place, and a snapshot older than that is already spent. The snapshot is refiled
 on the way past, so the store stops being stale too.
 
+### Borrowing a login from another machine
+
+Log in once, on one machine, and use that login from all of your others:
+
+```sh
+# on the laptop; "desktop" is any SSH destination that has cswap installed
+cswap borrow work --from me@desktop    # slot, email or alias as desktop knows it
+cswap switch work
+cswap lease                            # leave running; Ctrl-C to stop
+```
+
+The machine that did the browser login is the **owner**. It keeps the refresh
+token and is the only machine that ever refreshes. Every other machine gets the
+access token alone — no refresh token, nothing that could spend the lineage —
+so there is no way for two machines to fight over it, which is what breaks a
+plain `export`/`import` copy.
+
+The catch is that a refresh on the owner **revokes the previous access token
+immediately**. Whether cswap or Claude Code on the owner does the refresh, the
+token every borrower holds stops working at that moment. So `cswap lease` holds
+one `ssh <owner> cswap token <account> --watch` open per borrowed account; the
+owner checks for a new token every few seconds, refreshes shortly before expiry,
+and pushes each new one down the pipe. A borrower's Claude Code picks the new
+token up on its next message — a request in flight when the owner refreshes can
+fail with a 401, and simply retrying it works.
+
+- Without `lease` running, `cswap switch` onto a borrowed account fetches a fresh
+  token first. That is enough for short sessions; a long one outlives the token.
+- The owner must be reachable. While it is off or asleep, borrowers keep working
+  until the owner's next refresh would have happened, and then they stop.
+- The transport is plain SSH (`BatchMode`, so keys or an agent — no password
+  prompts). It works between Linux and Windows in either direction; a Windows
+  owner needs its OpenSSH Server enabled. `CSWAP_SSH` overrides the ssh binary.
+  If `cswap` is not on the owner's non-interactive `PATH`, pass
+  `--remote-bin /path/to/cswap` to `borrow`.
+- A borrowed slot shows as `borrowed from <host>` in `list`. It cannot be
+  exported or lent on, and cswap never tries to refresh it. Logging in as the
+  account locally and running `cswap add` makes the slot this machine's own
+  again.
+- `ssh desktop cswap token work | cswap borrow -` does a one-off borrow without
+  recording where it came from — nothing can renew it afterwards.
+- All borrowers draw on the owner account's quota, and this is for your own
+  machines. Handing a login to someone else is account sharing.
+
 ## Dependencies
 
 One, and only for T1: [`ureq`](https://docs.rs/ureq) (with `rustls`) for HTTPS to
@@ -177,6 +226,7 @@ Shared with claude-swap, byte-for-byte:
   configs/.claude-config-{n}-{email}.json
   credentials/.creds-{n}-{email}.enc   base64 of the slot's credential JSON
   cache/usage-cswap-rs.json            this port's quota cache (its own file)
+  cluster-cswap-rs.json                which slots are borrowed, and from where
 ```
 
 `XDG_DATA_HOME` and `CLAUDE_CONFIG_DIR` are both honoured.

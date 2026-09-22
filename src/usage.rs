@@ -12,6 +12,7 @@ use std::time::Duration;
 use crate::api;
 use crate::fsx::{self, R};
 use crate::json::Json;
+use crate::lease::Cluster;
 use crate::lock::FileLock;
 use crate::model::{Row, State, Usage, Window};
 use crate::paths;
@@ -32,6 +33,9 @@ pub fn collect(store_ref: &store::Store, force: bool, offline: bool) -> Vec<Row>
     let active = store_ref.active();
     let mut cache = Cache::load();
     let live_credentials = crate::live::read_credentials().ok().flatten();
+    let cluster = Cluster::load().unwrap_or(Cluster {
+        borrowed: Vec::new(),
+    });
 
     let mut rows = Vec::new();
     for account in accounts {
@@ -78,7 +82,8 @@ pub fn collect(store_ref: &store::Store, force: bool, offline: bool) -> Vec<Row>
         } else {
             None
         };
-        let row = match fetch_one(&account, is_active, live) {
+        let borrowed = cluster.get(&account).is_some();
+        let row = match fetch_one(&account, is_active, live, borrowed) {
             Ok(usage) => {
                 cache.put(account.num, &account.email, &usage);
                 Row {
@@ -113,7 +118,12 @@ pub fn collect(store_ref: &store::Store, force: bool, offline: bool) -> Vec<Row>
     rows
 }
 
-fn fetch_one(account: &Account, is_active: bool, live: Option<&str>) -> Result<Usage, State> {
+fn fetch_one(
+    account: &Account,
+    is_active: bool,
+    live: Option<&str>,
+    borrowed: bool,
+) -> Result<Usage, State> {
     let credentials = match resolve_credentials(account, is_active, live) {
         Ok(Some(c)) => c,
         Ok(None) => return Err(State::NoBackup),
@@ -123,9 +133,28 @@ fn fetch_one(account: &Account, is_active: bool, live: Option<&str>) -> Result<U
         return Err(State::ApiKey);
     }
 
+    // A borrowed login is never refreshed here: it has no refresh token, and
+    // the lineage belongs to the owner. Its `expiresAt` is advisory too — the
+    // owner renews it — so the token is simply tried, and a rejection means the
+    // owner has rotated it and this machine has not heard yet.
+    if borrowed {
+        let token = access_token(&credentials)
+            .ok_or_else(|| State::Error("borrowed login has no access token".into()))?;
+        return match api::fetch_usage(&token) {
+            Ok(usage) if usage.is_empty() => {
+                Err(State::Error("no usage windows in response".into()))
+            }
+            Ok(usage) => Ok(usage),
+            Err(api::ApiError::Unauthorized) => Err(State::Error(
+                "borrowed token rejected — the owner has renewed it; run `cswap lease`".into(),
+            )),
+            Err(e) => Err(State::Error(e.to_string())),
+        };
+    }
+
     let token = match access_token(&credentials) {
-        Some(t) if !is_expired(&credentials) => t,
-        _ => match ensure_fresh_token(account, is_active, &credentials) {
+        Some(t) if !expires_within(&credentials, EXPIRY_SKEW) => t,
+        _ => match ensure_fresh_token(account, is_active, &credentials, EXPIRY_SKEW) {
             Ok(t) => t,
             Err(state) => return Err(state),
         },
@@ -137,7 +166,7 @@ fn fetch_one(account: &Account, is_active: bool, live: Option<&str>) -> Result<U
         // The token was valid by its own clock but the server disagreed —
         // refresh once and retry, which is the whole of our retry policy.
         Err(api::ApiError::Unauthorized) => {
-            let token = ensure_fresh_token(account, is_active, &credentials)?;
+            let token = ensure_fresh_token(account, is_active, &credentials, EXPIRY_SKEW)?;
             api::fetch_usage(&token).map_err(|e| State::Error(e.to_string()))
         }
         Err(e) => Err(State::Error(e.to_string())),
@@ -168,6 +197,7 @@ fn ensure_fresh_token(
     account: &Account,
     is_active: bool,
     credentials: &str,
+    skew: i64,
 ) -> Result<String, State> {
     let _gate =
         FileLock::consume(account.num, Duration::from_secs(15)).map_err(|e| State::Error(e))?;
@@ -178,7 +208,7 @@ fn ensure_fresh_token(
         Ok(Some(c)) => c,
         _ => credentials.to_string(),
     };
-    if !is_expired(&current) {
+    if !expires_within(&current, skew) {
         if let Some(token) = access_token(&current) {
             return Ok(token);
         }
@@ -213,6 +243,80 @@ fn ensure_fresh_token(
             }
         }
         api::Refresh::Transient(msg) => Err(State::Error(msg)),
+    }
+}
+
+/// The credential an owner lends out: the slot's full login, refreshed first if
+/// it expires within `ahead` seconds. `is_live` says Claude Code on this
+/// machine is logged in as this account, in which case the live store is the
+/// truth and the backup may be a spent generation.
+///
+/// Returns the whole credential, refresh token included — the caller strips it.
+pub fn fresh_credential(account: &Account, is_live: bool, ahead: i64) -> R<String> {
+    if !is_live {
+        let current = store::read_backup(account.num, &account.email)?
+            .ok_or_else(|| format!("account {} has no stored login", account.num))?;
+        if !expires_within(&current, ahead) {
+            return Ok(current);
+        }
+        ensure_fresh_token(account, false, &current, ahead).map_err(state_message)?;
+        return store::read_backup(account.num, &account.email)?
+            .ok_or_else(|| format!("account {} lost its stored login", account.num));
+    }
+
+    let current = crate::live::read_credentials()?.ok_or("Claude Code is not logged in")?;
+    if !expires_within(&current, ahead) {
+        return Ok(current);
+    }
+    refresh_live(account, ahead)
+}
+
+/// Refresh the credential Claude Code is using right now.
+///
+/// This is the one place cswap holds Claude Code's credential locks across a
+/// network call, and it does so on purpose: it is doing exactly what Claude Code
+/// does under those locks — read, refresh, write — and serialising with it is
+/// the only way to guarantee the two never POST the same single-use refresh
+/// token. The loser of that race would be told the lineage is dead, and if the
+/// loser were Claude Code, it would log the owner out. The call is bounded by
+/// the API timeout (10s), well inside the 60s the lock protocol allows a holder.
+fn refresh_live(account: &Account, ahead: i64) -> R<String> {
+    // Same order `ensure_fresh_token` takes them — the gate, then Claude Code's
+    // locks — so a concurrent `cswap list` cannot deadlock against this.
+    let _gate = FileLock::consume(account.num, Duration::from_secs(15))?;
+    let _locks = crate::lock::DirLock::credentials()?;
+
+    // Re-read under the locks: Claude Code may have refreshed while we waited,
+    // and then its generation is current and ours would be a spent token.
+    let current = crate::live::read_credentials()?.ok_or("Claude Code is not logged in")?;
+    if !expires_within(&current, ahead) {
+        return Ok(current);
+    }
+    match api::refresh(&current) {
+        api::Refresh::Rotated(rotated) => {
+            // Live first: that is where the lineage now lives, and a crash
+            // between the two writes leaves the backup merely stale, which
+            // every path here already tolerates.
+            crate::live::write_credentials(&rotated)
+                .map_err(|e| format!("could not persist refreshed token: {e}"))?;
+            if let Err(e) = store::write_backup(account.num, &account.email, &rotated) {
+                eprintln!("cswap: warning: refreshed, but could not update the slot backup: {e}");
+            }
+            Ok(rotated)
+        }
+        api::Refresh::Dead => Err(format!(
+            "the login for {} has expired — log in as it again on this machine",
+            account.email
+        )),
+        api::Refresh::Transient(msg) => Err(format!("refresh failed: {msg}")),
+    }
+}
+
+fn state_message(state: State) -> String {
+    match state {
+        State::Dead => "the stored login has expired — log in as it again on this machine".into(),
+        State::Error(msg) => msg,
+        other => format!("could not refresh ({})", other.token()),
     }
 }
 
@@ -259,10 +363,10 @@ fn refresh_token_of(credentials: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-fn is_expired(credentials: &str) -> bool {
+fn expires_within(credentials: &str, secs: i64) -> bool {
     match oauth_block(credentials).and_then(|o| o.get_i64("expiresAt")) {
         // expiresAt is epoch milliseconds.
-        Some(ms) => ms / 1000 <= timefmt::now_unix() + EXPIRY_SKEW,
+        Some(ms) => ms / 1000 <= timefmt::now_unix() + secs,
         // No expiry recorded: treat as fresh and let the API decide, rather than
         // spending a single-use refresh token on a guess.
         None => false,

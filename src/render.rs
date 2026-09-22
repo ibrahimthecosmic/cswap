@@ -3,6 +3,7 @@
 use std::io::IsTerminal;
 
 use crate::json::Json;
+use crate::lease::Cluster;
 use crate::model::{Row, State, Window};
 use crate::store::Store;
 use crate::timefmt;
@@ -52,13 +53,13 @@ impl Style {
     }
 }
 
-pub fn human_list(store_ref: &Store, rows: &[Row]) {
+pub fn human_list(store_ref: &Store, rows: &[Row], cluster: &Cluster) {
     let style = Style::detect();
     for (i, row) in rows.iter().enumerate() {
         if i > 0 {
             println!();
         }
-        print_row(&style, row);
+        print_row(&style, row, cluster);
     }
 
     if store_ref.active().is_none() {
@@ -70,7 +71,7 @@ pub fn human_list(store_ref: &Store, rows: &[Row]) {
     }
 }
 
-fn print_row(style: &Style, row: &Row) {
+fn print_row(style: &Style, row: &Row, cluster: &Cluster) {
     let marker = if row.active {
         style.bold("●")
     } else {
@@ -87,6 +88,9 @@ fn print_row(style: &Style, row: &Row) {
     }
     if row.active {
         header.push_str(&style.dim("  (active)"));
+    }
+    if let Some(record) = cluster.get(&row.account) {
+        header.push_str(&style.dim(&format!("  borrowed from {}", record.source())));
     }
     println!("{header}");
 
@@ -147,18 +151,21 @@ fn note(state: &State) -> String {
     }
 }
 
-pub fn json_list(store_ref: &Store, rows: &[Row]) -> Json {
+pub fn json_list(store_ref: &Store, rows: &[Row], cluster: &Cluster) -> Json {
     let mut out = Json::obj();
     out.set("schemaVersion", Json::num(1));
     out.set(
         "activeAccountNumber",
         store_ref.active().map_or(Json::Null, Json::num),
     );
-    out.set("accounts", Json::Arr(rows.iter().map(json_row).collect()));
+    out.set(
+        "accounts",
+        Json::Arr(rows.iter().map(|row| json_row(row, cluster)).collect()),
+    );
     out
 }
 
-fn json_row(row: &Row) -> Json {
+fn json_row(row: &Row, cluster: &Cluster) -> Json {
     let mut entry = Json::obj();
     entry.set("number", Json::num(row.account.num));
     entry.set("email", Json::str(&row.account.email));
@@ -169,6 +176,9 @@ fn json_row(row: &Row) -> Json {
         entry.set("organizationName", Json::str(org));
     }
     entry.set("active", Json::Bool(row.active));
+    if let Some(record) = cluster.get(&row.account) {
+        entry.set("borrowedFrom", Json::str(record.source()));
+    }
     entry.set("usageStatus", Json::str(row.state.token()));
 
     match &row.usage {

@@ -7,96 +7,12 @@
 //! machines. The regression they exist for — exporting a superseded credential —
 //! passed every in-module test while shipping a login that was dead on arrival.
 
+mod common;
+
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::path::Path;
 
-const BIN: &str = env!("CARGO_BIN_EXE_cswap");
-
-/// A throwaway machine: its own claude-swap store and its own Claude Code
-/// config directory, both under one temp root.
-struct Machine {
-    root: PathBuf,
-}
-
-impl Machine {
-    fn new(name: &str) -> Machine {
-        let root = std::env::temp_dir().join(format!(
-            "cswap-it-{}-{name}-{}",
-            std::process::id(),
-            // Two machines in one test must not collide, and neither must two
-            // tests: cargo runs them in threads of one process.
-            std::thread::current()
-                .name()
-                .unwrap_or("t")
-                .replace("::", "-")
-        ));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(root.join("config")).expect("temp dir");
-        Machine { root }
-    }
-
-    fn config_dir(&self) -> PathBuf {
-        self.root.join("config")
-    }
-
-    fn run(&self, args: &[&str]) -> Output {
-        Command::new(BIN)
-            .args(args)
-            .env("XDG_DATA_HOME", self.root.join("data"))
-            .env("CLAUDE_CONFIG_DIR", self.config_dir())
-            // The store root is XDG on Linux only; elsewhere it follows $HOME.
-            .env("HOME", &self.root)
-            .env("USERPROFILE", &self.root)
-            .output()
-            .expect("run cswap")
-    }
-
-    fn ok(&self, args: &[&str]) -> String {
-        let out = self.run(args);
-        assert!(
-            out.status.success(),
-            "cswap {args:?} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        String::from_utf8_lossy(&out.stdout).into_owned()
-    }
-
-    /// Put a credential and a matching `oauthAccount` in place, as a login does.
-    fn log_in_as(&self, email: &str, generation: &str) {
-        fs::write(
-            self.config_dir().join(".credentials.json"),
-            format!(
-                r#"{{"claudeAiOauth":{{"accessToken":"access-{generation}",
-                   "refreshToken":"refresh-{generation}","expiresAt":1787811738997}}}}"#
-            ),
-        )
-        .expect("write credential");
-        fs::write(
-            self.config_dir().join(".claude.json"),
-            format!(
-                r#"{{"numStartups":4,"projects":{{"/w":{{"history":["private"]}}}},
-                   "oauthAccount":{{"accountUuid":"uuid-{email}","emailAddress":"{email}",
-                   "organizationUuid":"org","organizationName":"Org"}}}}"#
-            ),
-        )
-        .expect("write config");
-    }
-
-    fn live_credential(&self) -> String {
-        fs::read_to_string(self.config_dir().join(".credentials.json")).expect("live credential")
-    }
-
-    fn live_config(&self) -> String {
-        fs::read_to_string(self.config_dir().join(".claude.json")).expect("live config")
-    }
-}
-
-impl Drop for Machine {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
-    }
-}
+use common::Machine;
 
 fn exported_file(path: &Path) -> String {
     fs::read_to_string(path).expect("export file")

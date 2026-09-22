@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use crate::fsx::{self, R};
 use crate::json::Json;
+use crate::lease::{self, Cluster};
 use crate::lock::{DirLock, FileLock};
 use crate::model::Row;
 use crate::portable::{self, Portable};
@@ -20,17 +21,25 @@ pub fn list(flags: &Flags) -> R<ExitCode> {
     let accounts = store_ref.accounts();
     if accounts.is_empty() {
         if flags.json {
-            println!("{}", render::json_list(&store_ref, &[]).dump_pretty());
+            let cluster = Cluster::load()?;
+            println!(
+                "{}",
+                render::json_list(&store_ref, &[], &cluster).dump_pretty()
+            );
         } else {
             println!("No accounts yet. Log into Claude Code, then run `cswap add`.");
         }
         return Ok(ExitCode::SUCCESS);
     }
     let rows = rows_for(&store_ref, flags);
+    let cluster = Cluster::load()?;
     if flags.json {
-        println!("{}", render::json_list(&store_ref, &rows).dump_pretty());
+        println!(
+            "{}",
+            render::json_list(&store_ref, &rows, &cluster).dump_pretty()
+        );
     } else {
-        render::human_list(&store_ref, &rows);
+        render::human_list(&store_ref, &rows, &cluster);
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -78,6 +87,9 @@ pub fn status(flags: &Flags) -> R<ExitCode> {
 }
 
 pub fn switch(selector: Option<&str>, flags: &Flags) -> R<ExitCode> {
+    // Outside the store lock: it may wait on the network for a while.
+    crate::cluster::renew_before_switch(selector);
+
     let _guard = FileLock::store(STORE_LOCK_TIMEOUT)?;
     let mut store_ref = Store::load()?;
     let accounts = store_ref.accounts();
@@ -232,6 +244,11 @@ pub fn add(flags: &Flags) -> R<ExitCode> {
 
     store::write_backup(account.num, &account.email, &credentials)?;
     store::write_config(account.num, &account.email, &config)?;
+    // A login that can refresh itself is this machine's own, whatever the slot
+    // held before. Re-adding a borrowed one leaves it borrowed.
+    if lease::has_refresh_token(&credentials) {
+        lease::forget_slot(num)?;
+    }
     store_ref.register(&account);
     if let Some(alias) = &flags.alias {
         set_alias(&mut store_ref, num, alias);
@@ -278,6 +295,7 @@ pub fn remove(selector: &str, flags: &Flags) -> R<ExitCode> {
     let was_active = store_ref.active() == Some(num);
     store::remove_backup(account.num, &account.email);
     store_ref.unregister(num);
+    lease::forget_slot(num)?;
     store_ref.save()?;
 
     println!("Removed account {} ({}).", account.num, account.email);
@@ -323,9 +341,26 @@ pub fn export(selector: Option<&str>, flags: &Flags) -> R<ExitCode> {
     let live_email =
         live::active_identity()?.and_then(|o| o.get_str("emailAddress").map(str::to_string));
     let live_credentials = live::read_credentials()?;
+    let cluster = Cluster::load()?;
 
     let mut items = Vec::new();
     for account in &selected {
+        // A borrowed login is an access token the owner will revoke on its next
+        // refresh. Exporting it would hand a third machine something that dies
+        // on arrival, and does so without the owner's say.
+        if let Some(record) = cluster.get(account) {
+            let e = format!(
+                "account {} ({}): borrowed from {} — export it on the machine that owns it",
+                account.num,
+                account.email,
+                record.source()
+            );
+            if selector.is_none() {
+                eprintln!("cswap: skipping {e}");
+                continue;
+            }
+            return Err(e);
+        }
         let live = live_email
             .as_deref()
             .filter(|e| e.eq_ignore_ascii_case(&account.email))
@@ -416,47 +451,17 @@ pub fn import(source: &str, flags: &Flags) -> R<ExitCode> {
     let mut imported: Vec<(i64, String, bool)> = Vec::new();
 
     for item in &items {
-        // Matching on identity first means re-importing an account updates the
-        // slot it already has — that is how a refreshed export replaces a login
-        // that expired here.
-        let existing = store_ref.accounts().into_iter().find(|a| {
-            a.email.eq_ignore_ascii_case(&item.email) || (a.uuid.is_some() && a.uuid == item.uuid)
-        });
-        let num = match (flags.slot, &existing) {
-            (Some(slot), _) => slot,
-            (None, Some(account)) => account.num,
-            (None, None) => store_ref.free_slot(),
-        };
-
-        if let Some(occupant) = store_ref.get(num) {
-            if !occupant.email.eq_ignore_ascii_case(&item.email) {
-                if !flags.force {
-                    return Err(format!(
-                        "slot {num} already holds {} — pass --force to overwrite it",
-                        occupant.email
-                    ));
-                }
-                // The store keys its files by slot *and* email, so overwriting
-                // with a different identity would otherwise strand the old
-                // account's credential on disk under nobody's name.
-                store::remove_backup(occupant.num, &occupant.email);
-            }
-        }
-
-        // The same account arriving at a different slot is a move, not a copy:
-        // two slots claiming one login make `switch <email>` ambiguous.
-        let mut keep_active = false;
-        if let Some(previous) = existing.as_ref().filter(|a| a.num != num) {
-            if !flags.force {
-                return Err(format!(
-                    "{} is already stored in slot {} — pass --force to move it to slot {num}",
-                    item.email, previous.num
-                ));
-            }
-            keep_active = store_ref.active() == Some(previous.num);
-            store::remove_backup(previous.num, &previous.email);
-            store_ref.unregister(previous.num);
-        }
+        let Placement {
+            num,
+            existing,
+            keep_active,
+        } = place(
+            &mut store_ref,
+            &item.email,
+            item.uuid.as_deref(),
+            flags.slot,
+            flags.force,
+        )?;
 
         let alias = if items.len() == 1 {
             flags.alias.clone()
@@ -466,6 +471,9 @@ pub fn import(source: &str, flags: &Flags) -> R<ExitCode> {
         let account = item.to_account(num, alias);
 
         store::write_backup(num, &account.email, &item.credentials)?;
+        if lease::has_refresh_token(&item.credentials) {
+            lease::forget_slot(num)?;
+        }
         // `switch` reads exactly one key out of the stored snapshot, so a slot
         // that has none only needs that key. One that already has a full
         // snapshot keeps it — the import is a new login for the same account,
@@ -524,6 +532,75 @@ pub fn import(source: &str, flags: &Flags) -> R<ExitCode> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Where an incoming login lands, for `import` and `borrow`.
+pub(crate) struct Placement {
+    pub num: i64,
+    /// The account as it was already stored here, if it was.
+    pub existing: Option<Account>,
+    /// The account moved slots and was the active one; the new slot inherits it.
+    pub keep_active: bool,
+}
+
+/// Choose the slot for an incoming login and clear the way to it.
+///
+/// Matching on identity first means a login arriving again updates the slot it
+/// already has — that is how a refreshed export replaces one that expired here.
+/// `--slot` overrides that, and `--force` is needed to evict someone else or to
+/// move an account between slots.
+pub(crate) fn place(
+    store_ref: &mut Store,
+    email: &str,
+    uuid: Option<&str>,
+    slot: Option<i64>,
+    force: bool,
+) -> R<Placement> {
+    let existing = store_ref.accounts().into_iter().find(|a| {
+        a.email.eq_ignore_ascii_case(email) || (a.uuid.is_some() && a.uuid.as_deref() == uuid)
+    });
+    let num = match (slot, &existing) {
+        (Some(slot), _) => slot,
+        (None, Some(account)) => account.num,
+        (None, None) => store_ref.free_slot(),
+    };
+
+    if let Some(occupant) = store_ref.get(num) {
+        if !occupant.email.eq_ignore_ascii_case(email) {
+            if !force {
+                return Err(format!(
+                    "slot {num} already holds {} — pass --force to overwrite it",
+                    occupant.email
+                ));
+            }
+            // The store keys its files by slot *and* email, so overwriting
+            // with a different identity would otherwise strand the old
+            // account's credential on disk under nobody's name.
+            store::remove_backup(occupant.num, &occupant.email);
+            lease::forget_slot(occupant.num)?;
+        }
+    }
+
+    // The same account arriving at a different slot is a move, not a copy:
+    // two slots claiming one login make `switch <email>` ambiguous.
+    let mut keep_active = false;
+    if let Some(previous) = existing.as_ref().filter(|a| a.num != num) {
+        if !force {
+            return Err(format!(
+                "{email} is already stored in slot {} — pass --force to move it to slot {num}",
+                previous.num
+            ));
+        }
+        keep_active = store_ref.active() == Some(previous.num);
+        store::remove_backup(previous.num, &previous.email);
+        store_ref.unregister(previous.num);
+        lease::forget_slot(previous.num)?;
+    }
+    Ok(Placement {
+        num,
+        existing,
+        keep_active,
+    })
 }
 
 /// Gather one account for export. `live` is the credential Claude Code is using
@@ -609,7 +686,7 @@ fn back_up(account: &Account, credentials: &str) -> R<()> {
     Ok(())
 }
 
-fn set_alias(store_ref: &mut Store, num: i64, alias: &str) {
+pub(crate) fn set_alias(store_ref: &mut Store, num: i64, alias: &str) {
     if let Some(accounts) = store_ref.data.get_mut("accounts") {
         if let Some(record) = accounts.get_mut(&num.to_string()) {
             record.set("alias", Json::str(alias));

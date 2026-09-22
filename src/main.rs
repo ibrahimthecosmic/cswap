@@ -5,11 +5,14 @@
 //! machine. Scope is deliberately two tiers: T0, the switcher (`add`, `list`,
 //! `switch`, `status`, `remove`), and T1, live quota numbers on `list`.
 //! Auto-switching, session mode and the TUI are out of scope; `export` and
-//! `import` move accounts between machines without one.
+//! `import` move accounts between machines, and `borrow` / `lease` / `token`
+//! share one login across them without copying its refresh token.
 
 mod b64;
+mod cluster;
 mod fsx;
 mod json;
+mod lease;
 mod live;
 mod lock;
 mod model;
@@ -76,6 +79,13 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
             "--force" | "-f" => flags.force = true,
             "--yes" | "-y" => flags.yes = true,
             "--check" => flags.check = true,
+            "--watch" => flags.watch = true,
+            "--from" => {
+                flags.from = Some(it.next().ok_or("--from needs an SSH destination")?.clone())
+            }
+            "--remote-bin" => {
+                flags.remote_bin = Some(it.next().ok_or("--remote-bin needs a path")?.clone())
+            }
             "--slot" => {
                 let value = it.next().ok_or("--slot needs a number")?;
                 flags.slot = Some(
@@ -121,6 +131,21 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
             cmd::import(source, &flags)
         }
         "upgrade" => cmd::upgrade(&flags),
+        "token" => {
+            let target = rest
+                .first()
+                .copied()
+                .ok_or("token needs an account (slot, email or alias)")?;
+            cluster::token(target, &flags)
+        }
+        "borrow" => {
+            let source = rest
+                .first()
+                .copied()
+                .ok_or("borrow needs an account on the owner (or `-` for a lease on stdin)")?;
+            cluster::borrow(source, &flags)
+        }
+        "lease" => cluster::lease(&flags),
         "remove" | "rm" => {
             let target = rest
                 .first()
@@ -141,9 +166,12 @@ pub struct Flags {
     pub force: bool,
     pub yes: bool,
     pub check: bool,
+    pub watch: bool,
     pub slot: Option<i64>,
     pub alias: Option<String>,
     pub output: Option<String>,
+    pub from: Option<String>,
+    pub remote_bin: Option<String>,
 }
 
 fn help_text() -> String {
@@ -164,6 +192,12 @@ COMMANDS
   import <file>        Read accounts back out of one (`-` reads stdin)
   upgrade              Replace this binary with the latest GitHub release
 
+  borrow <account> --from <host>
+                       Use a login owned by another machine, over SSH
+  lease                Keep borrowed logins current (runs until stopped)
+  token <account>      Print a lease for a login this machine owns (what
+                       `borrow` and `lease` run on the owner)
+
   <account> is a slot number, an email, or an alias.
 
 OPTIONS
@@ -179,9 +213,16 @@ OPTIONS
                        import: overwrite or move an occupied slot
   --yes                remove: do not ask for confirmation
   --check              upgrade: report what is available, install nothing
+  --from <host>        borrow: the owner's SSH destination, e.g. me@desktop
+  --remote-bin <path>  borrow: cswap's path on the owner, if not on its PATH
+  --watch              token: keep running and print each new token
   --help, --version
 
 NOTES
+  A borrowed login is an access token only; the owner alone refreshes it,
+  and each refresh revokes the token before it. Keep `cswap lease` running
+  on the borrowing machine, or `switch` fetches a fresh one when it can.
+
   An export holds live login tokens in plaintext. It is written owner-only;
   keep it off shared storage and delete it once it has been imported.
 
