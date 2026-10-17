@@ -20,7 +20,7 @@ fn lease_from(owner: &Machine, account: &str) -> String {
 }
 
 fn backup_files(machine: &Machine) -> String {
-    let dir = machine.root.join("data/claude-swap/credentials");
+    let dir = machine.store_dir().join("credentials");
     let mut all = String::new();
     for entry in fs::read_dir(&dir).expect("credentials dir").flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();

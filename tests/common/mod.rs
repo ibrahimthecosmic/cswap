@@ -38,6 +38,15 @@ impl Machine {
         self.root.join("config")
     }
 
+    /// The claude-swap store, wherever `command` makes this platform put it.
+    pub fn store_dir(&self) -> PathBuf {
+        if cfg!(target_os = "linux") {
+            self.root.join("data").join("claude-swap")
+        } else {
+            self.root.join(".claude-swap-backup")
+        }
+    }
+
     /// The binary, pointed at this machine's store and config.
     pub fn command(&self, args: &[&str]) -> Command {
         let mut cmd = Command::new(BIN);
