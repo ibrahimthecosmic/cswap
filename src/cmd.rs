@@ -144,6 +144,19 @@ pub fn switch(selector: Option<&str>, flags: &Flags) -> R<ExitCode> {
         if let Some(outgoing) = store_ref.get(from) {
             back_up(&outgoing, credentials)?;
         }
+    } else if original_credentials.is_some() {
+        // `from` is the live identity, so a live login with no slot is one cswap
+        // never stored — nothing to file it under, and this switch replaces it.
+        if let Some(email) = live::active_identity()
+            .ok()
+            .flatten()
+            .and_then(|o| o.get_str("emailAddress").map(str::to_string))
+        {
+            eprintln!(
+                "cswap: warning: Claude Code was logged in as {email}, which cswap does not \
+                 store; that login is replaced. Log in as it and run `cswap add` to keep it."
+            );
+        }
     }
 
     {

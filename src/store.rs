@@ -61,7 +61,41 @@ impl Store {
                 fresh
             }
         };
-        Ok(Store { data })
+        let mut store = Store { data };
+        // An unreadable live config says nothing about who is logged in; keep
+        // the marker rather than guess.
+        if let Ok(identity) = crate::live::active_identity() {
+            store.follow_live(identity.as_ref());
+        }
+        Ok(store)
+    }
+
+    /// Point the active marker at whoever Claude Code is logged in as.
+    ///
+    /// The marker only records what cswap last did. A `/login`, `claude auth
+    /// login` or any other tool replaces the live login without the store
+    /// hearing of it, and a marker trusted after that makes `switch` call the
+    /// real target "already active" and file the live credential under the
+    /// wrong slot. The live `oauthAccount` is the truth; an identity the store
+    /// does not hold, or none at all, leaves nothing active.
+    fn follow_live(&mut self, identity: Option<&Json>) {
+        let live = identity.and_then(|o| self.slot_of(o));
+        self.data
+            .set("activeAccountNumber", live.map_or(Json::Null, Json::num));
+    }
+
+    /// The slot holding the account an `oauthAccount` block names, matched the
+    /// way `add` matches: by email, or by account uuid.
+    fn slot_of(&self, oauth_account: &Json) -> Option<i64> {
+        let email = oauth_account.get_str("emailAddress");
+        let uuid = oauth_account.get_str("accountUuid");
+        self.accounts()
+            .into_iter()
+            .find(|a| {
+                email.is_some_and(|e| a.email.eq_ignore_ascii_case(e))
+                    || (uuid.is_some() && a.uuid.as_deref() == uuid)
+            })
+            .map(|a| a.num)
     }
 
     pub fn save(&mut self) -> R<()> {
@@ -375,6 +409,23 @@ mod tests {
         let nums: Vec<i64> = store.accounts().iter().map(|a| a.num).collect();
         assert_eq!(nums, vec![1, 2, 3]);
         assert!(store.get(2).unwrap().email == "b@x.com");
+    }
+
+    #[test]
+    fn the_marker_follows_whoever_claude_code_is_logged_in_as() {
+        // Marked 2, but a `/login` behind cswap's back made it account 1.
+        let mut store = two_accounts();
+        store.follow_live(Some(&Json::parse(r#"{"emailAddress":"A@x.com"}"#).unwrap()));
+        assert_eq!(store.active(), Some(1));
+
+        // A login the store does not hold is not any slot's.
+        store.follow_live(Some(&Json::parse(r#"{"emailAddress":"z@x.com"}"#).unwrap()));
+        assert_eq!(store.active(), None);
+
+        // Logged out: nothing is active, whatever cswap last switched to.
+        let mut store = two_accounts();
+        store.follow_live(None);
+        assert_eq!(store.active(), None);
     }
 
     #[test]
