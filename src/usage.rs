@@ -94,14 +94,8 @@ pub fn collect(store_ref: &store::Store, force: bool, offline: bool) -> Vec<Row>
                     state: State::Live,
                 }
             }
-            // A failed fetch falls back to the last known numbers rather than
-            // showing nothing: stale quota beats no quota when you are deciding
-            // where to switch.
             Err(state) => {
-                let (usage, at) = match cached {
-                    Some((u, t)) => (Some(u), Some(t)),
-                    None => (None, None),
-                };
+                let (usage, at) = fallback(&state, cached);
                 Row {
                     account,
                     active: is_active,
@@ -170,6 +164,18 @@ fn fetch_one(
             api::fetch_usage(&token).map_err(|e| State::Error(e.to_string()))
         }
         Err(e) => Err(State::Error(e.to_string())),
+    }
+}
+
+/// What a row shows when this run could not fetch. A failure falls back to the
+/// last known numbers rather than showing nothing: stale quota beats no quota
+/// when you are deciding where to switch. A dead login is the exception —
+/// nothing can switch to it until someone logs in again, so its old numbers
+/// only make it look usable.
+fn fallback(state: &State, cached: Option<(Usage, i64)>) -> (Option<Usage>, Option<i64>) {
+    match cached {
+        Some((usage, at)) if !matches!(state, State::Dead) => (Some(usage), Some(at)),
+        _ => (None, None),
     }
 }
 
@@ -483,5 +489,37 @@ impl Cache {
         }
         // A cache is a convenience; failing to write one is not worth an error.
         let _ = fsx::write_atomic(&Cache::path(), &self.data.dump_pretty());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cached() -> Option<(Usage, i64)> {
+        let window = Window {
+            label: "7d".into(),
+            pct: 99.0,
+            resets_at: None,
+        };
+        Some((
+            Usage {
+                seven_day: Some(window),
+                ..Usage::default()
+            },
+            1_000,
+        ))
+    }
+
+    #[test]
+    fn a_failed_fetch_keeps_the_last_known_numbers() {
+        let (usage, at) = fallback(&State::Error("timeout".into()), cached());
+        assert!(usage.is_some());
+        assert_eq!(at, Some(1_000));
+    }
+
+    #[test]
+    fn a_dead_login_shows_no_numbers() {
+        assert!(fallback(&State::Dead, cached()).0.is_none());
     }
 }

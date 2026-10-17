@@ -93,20 +93,32 @@ fn print_row(style: &Style, row: &Row, cluster: &Cluster) {
         header.push_str(&style.dim(&format!("  borrowed from {}", record.source())));
     }
     println!("{header}");
+    for line in body_lines(style, row) {
+        println!("    {line}");
+    }
+}
 
+/// The lines under a row's header. Numbers that were not fetched this run say
+/// how old they are, and a failed fetch says why, so last-known quota is never
+/// mistaken for current quota.
+fn body_lines(style: &Style, row: &Row) -> Vec<String> {
     match (&row.usage, &row.state) {
-        (Some(usage), _) if !usage.is_empty() => {
-            for window in usage.windows() {
-                println!("    {}", window_line(style, window));
+        (Some(usage), state) if !usage.is_empty() => {
+            let mut lines: Vec<String> = usage
+                .windows()
+                .map(|window| window_line(style, window))
+                .collect();
+            if !matches!(state, State::Live) {
+                if let Some(age) = row.age() {
+                    lines.push(style.dim(&format!("measured {}", timefmt::ago(age))));
+                }
             }
-            if let (State::Cached, Some(age)) = (&row.state, row.age()) {
-                println!(
-                    "    {}",
-                    style.dim(&format!("measured {}", timefmt::ago(age)))
-                );
+            if let State::Error(_) = state {
+                lines.push(style.dim(&note(state)));
             }
+            lines
         }
-        (_, state) => println!("    {}", style.dim(&note(state))),
+        (_, state) => vec![style.dim(&note(state))],
     }
 }
 
@@ -235,4 +247,63 @@ pub fn json_switch(switched: bool, from: Option<i64>, to: i64, reason: &str) -> 
     out.set("to", Json::num(to));
     out.set("reason", Json::str(reason));
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::Usage;
+    use crate::store::Account;
+
+    fn row(state: State, usage: Option<Usage>) -> Row {
+        Row {
+            account: Account {
+                num: 1,
+                email: "a@x.com".into(),
+                uuid: None,
+                org_uuid: None,
+                org_name: None,
+                alias: None,
+            },
+            active: true,
+            usage,
+            fetched_at: Some(timefmt::now_unix() - 5_400),
+            state,
+        }
+    }
+
+    fn some_usage() -> Option<Usage> {
+        Some(Usage {
+            seven_day: Some(Window {
+                label: "7d".into(),
+                pct: 99.0,
+                resets_at: None,
+            }),
+            ..Usage::default()
+        })
+    }
+
+    fn lines(row: &Row) -> String {
+        body_lines(&Style { on: false }, row).join("\n")
+    }
+
+    #[test]
+    fn numbers_from_a_failed_fetch_say_how_old_they_are_and_why() {
+        let text = lines(&row(State::Error("timeout".into()), some_usage()));
+        assert!(text.contains("99%"), "{text}");
+        assert!(text.contains("measured"), "{text}");
+        assert!(text.contains("usage unavailable (timeout)"), "{text}");
+    }
+
+    #[test]
+    fn a_dead_login_says_so() {
+        let text = lines(&row(State::Dead, None));
+        assert!(text.contains("stored login has expired"), "{text}");
+    }
+
+    #[test]
+    fn fresh_numbers_carry_no_caveats() {
+        let text = lines(&row(State::Live, some_usage()));
+        assert!(!text.contains("measured"), "{text}");
+    }
 }
